@@ -22,7 +22,7 @@ def ask_holmes(query):
                 "ask": query,
                 "model": MODEL
             },
-            timeout=180 # AI-undersøkelser kan ta tid
+            timeout=600 # AI-undersøkelser kan ta tid
         )
         response.raise_for_status()
         data = response.json()
