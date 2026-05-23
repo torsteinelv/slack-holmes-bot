@@ -114,6 +114,7 @@ def extract_tasks_from_json(obj):
     return None
 
 def process_message_async(client, message, say):
+    """Kjører asynkront i bakgrunnen."""
     channel = message.get("channel")
     ts = message.get("ts")
     thread_ts = message.get("thread_ts", ts)
@@ -125,6 +126,7 @@ def process_message_async(client, message, say):
     if not user_query:
         return
 
+    # 1. Send initial statusmelding til Slack
     try:
         placeholder = say(text="🔍 _Holmes oppretter en feilsøkingsplan..._", thread_ts=thread_ts)
         placeholder_ts = placeholder.get("ts")
@@ -132,6 +134,7 @@ def process_message_async(client, message, say):
         logging.error(f"Feil ved sending av initial status: {e}")
         return
 
+    # 2. Hent trådkontekst hvis relevant
     if message.get("thread_ts"):
         history = get_thread_context(client, channel, thread_ts)
         prompt = (f"Du er en AI-assistent i en pågående Slack-samtale. Her er historikken:\n"
@@ -143,13 +146,15 @@ def process_message_async(client, message, say):
     current_action = "Oppretter kobling til klyngen..."
     final_answer = "Fikk ingen endelig analyse fra Holmes."
 
+    # 3. Stream fra Holmes-API-et med smart timeout
     try:
+        logging.info(f"Starter live-analyse for query: '{user_query[:50]}...'")
         response = requests.post(
             f"{HOLMES_URL}/api/chat",
             json={"ask": prompt, "model": MODEL, "stream": True},
             headers={"Accept": "text/event-stream"},
             stream=True,
-            timeout=600
+            timeout=(15, 120)  # 15 sek for å koble til, 120 sek max stillhet mellom events
         )
         response.raise_for_status()
 
@@ -201,10 +206,17 @@ def process_message_async(client, message, say):
                 except Exception as parse_err:
                     logging.error(f"Tolkningsfeil: {parse_err}")
 
+        # Erstatt med endelig svar når strømmen er ferdig
         client.chat_update(channel=channel, ts=placeholder_ts, text=final_answer)
+        logging.info("Suksess: Feilsøking fullført og endelig svar sendt til Slack.")
 
+    except requests.exceptions.Timeout:
+        error_msg = "❌ Det oppstod et tidsavbrudd: Holmes har ikke sendt noen oppdateringer på 2 minutter. Sjekk `kubectl logs` for Holmes-serveren."
+        logging.error("Tidsavbrudd (Timeout) under feilsøking.")
+        client.chat_update(channel=channel, ts=placeholder_ts, text=error_msg)
     except Exception as e:
         error_msg = f"❌ Det oppstod en feil under undersøkelsen: {str(e)}"
+        logging.error(f"Feil under prosessering av melding: {str(e)}")
         client.chat_update(channel=channel, ts=placeholder_ts, text=error_msg)
 
 @app.message("") 
@@ -218,5 +230,10 @@ def handle_app_mentions(event, client, say):
     threading.Thread(target=process_message_async, args=(client, event, say)).start()
 
 if __name__ == "__main__":
+    if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
+        logging.critical("Mangler SLACK_BOT_TOKEN eller SLACK_APP_TOKEN!")
+        exit(1)
+        
+    logging.info("🚀 Starter Holmes Slack Bot (Mode: Enterprise Async m/ Live JSON Table Rendering)")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
