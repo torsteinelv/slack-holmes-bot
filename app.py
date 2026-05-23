@@ -6,7 +6,7 @@ import threading
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# --- Konfigurere strukturert logging for Kubernetes ---
+# --- Konfigurer strukturert logging for Kubernetes ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -53,6 +53,22 @@ def update_slack_status(client, channel, ts, tasks, action):
         client.chat_update(channel=channel, ts=ts, text=status_text)
     except Exception as e:
         logging.error(f"Feil ved oppdatering av Slack-status: {e}")
+
+def find_table_in_json(obj):
+    """Søker rekursivt igjennom et JSON-objekt for å finne ASCII-tabellen fra TodoWrite."""
+    if isinstance(obj, str) and "+--" in obj and "Status" in obj:
+        return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            res = find_table_in_json(v)
+            if res:
+                return res
+    if isinstance(obj, list):
+        for item in obj:
+            res = find_table_in_json(item)
+            if res:
+                return res
+    return None
 
 def process_message_async(client, message, say):
     """Kjører asynkront i bakgrunnen. Håndterer strømming, oppgavelister og sluttresultat."""
@@ -124,64 +140,42 @@ def process_message_async(client, message, say):
                 try:
                     data = json.loads(data_str)
                     
-                    # EVENT: Holmes starter et nytt verktøy (f.eks. en kubectl-kommando)
+                    # --- DYNAMISK TABELL-SKANNING ---
+                    # Sjekker om denne datapakken inneholder oppgavelisten, uavhengig av struktur og feltnavn
+                    if "+--" in data_str and "Status" in data_str:
+                        found_table = find_table_in_json(data)
+                        if found_table:
+                            current_tasks = found_table.strip()
+                            logging.info(f"Suksess: Fant og oppdaterte oppgaveliste via global skanning ({len(current_tasks)} tegn).")
+
+                    # --- HÅNDTERING AV EVENTS ---
                     if current_event == "start_tool_calling":
                         tool_name = data.get("tool_name", "")
                         description = data.get("description", "Undersøker...")
-                        logging.info(f"[Holmes Event] Starter verktøy: {tool_name} -> {description}")
+                        logging.info(f"[Holmes Event] Starter verktøy: {tool_name}")
                         
                         if tool_name == "TodoWrite":
                             current_action = "📝 _Oppdaterer planen over oppgaver..._"
                         else:
                             current_action = f"🔨 _Kjører verktøy:_ `{tool_name}`\n📋 {description}"
-                        
-                        update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
-                    
-                    # EVENT: Et verktøy ble ferdig. Her fanger vi opp oppgaveliste-tabellen fra TodoWrite
-                    elif current_event == "tool_calling_result":
-                        tool_name = data.get("name") or data.get("tool_name")
-                        result_obj = data.get("result")
-                        logging.info(f"[Holmes Event] Verktøy fullført: {tool_name}")
-                        
-                        if tool_name == "TodoWrite" and result_obj:
-                            found_tasks = None
-                            
-                            # Sjekk 1: Hvis resultatet er en ren rå tekststreng (slik loggen din indikerer)
-                            if isinstance(result_obj, str) and "+--" in result_obj:
-                                found_tasks = result_obj.strip()
-                            
-                            # Sjekk 2: Hvis det er pakket inn i en ordbok (som fallback)
-                            elif isinstance(result_obj, dict):
-                                for key in ["data", "output", "result", "content"]:
-                                    val = result_obj.get(key)
-                                    if isinstance(val, str) and "+--" in val:
-                                        found_tasks = val.strip()
-                                        break
-                                else:
-                                    if "+--" in str(result_obj):
-                                        found_tasks = str(result_obj).strip()
-                            
-                            # Hvis vi fant en gyldig ASCII-tabell, oppdater Slack!
-                            if found_tasks:
-                                current_tasks = found_tasks
-                                logging.info(f"Suksess: Fant og oppdaterte oppgaveliste ({len(current_tasks)} tegn)")
-                                update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
                     
                     elif current_event == "ai_message":
                         thought = data.get("message", "")
                         if thought:
                             logging.info(f"[Holmes Event] AI Tenker: {thought}")
                             current_action = f"💭 _Tenker:_ {thought}"
-                            update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
                     
                     elif current_event == "ai_answer_end":
                         logging.info("[Holmes Event] Endelig analyse mottatt fra Holmes.")
                         final_answer = data.get("analysis", final_answer)
+                    
+                    # Oppdaterer Slack-meldingen live for hvert event i strømmen
+                    update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
                         
                 except Exception as parse_err:
                     logging.error(f"Kunne ikke tolke live-data JSON: {parse_err}")
 
-        # 4. Erstatt statusen med det endelige svaret i Slack
+        # 4. Erstatt statusen med det endelige svaret i Slack når loopen avsluttes
         logging.info(f"Oppdaterer Slack-melding {placeholder_ts} med endelig svar.")
         client.chat_update(channel=channel, ts=placeholder_ts, text=final_answer)
         logging.info("Forespørsel ferdig behandlet og fullført.")
