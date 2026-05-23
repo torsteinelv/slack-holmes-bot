@@ -37,13 +37,13 @@ def get_thread_context(client, channel, thread_ts):
         logging.error(f"Kunne ikke hente trådhistorikk: {e}")
         return ""
 
-def update_slack_status(client, channel, ts, tasks, action):
+def update_slack_status(client, channel, ts, tasks_table, action):
     """Bygger og oppdaterer fremdriftsstatusen i Slack-meldingen."""
     status_text = "🔍 *Holmes feilsøker saken...*\n"
     
-    # Tegner tabellen øverst hvis den er funnet
-    if tasks:
-        status_text += f"\n```\n{tasks}\n```\n"
+    # Tegner tabellen øverst hvis den er funnet og generert
+    if tasks_table:
+        status_text += f"\n```\n{tasks_table}\n```\n"
         
     # Tegner handlingen nederst
     if action:
@@ -54,62 +54,66 @@ def update_slack_status(client, channel, ts, tasks, action):
     except Exception as e:
         logging.error(f"Feil ved oppdatering av Slack-status: {e}")
 
-def extract_table(text):
-    """Hjelpefunksjon som trekker ut ASCII-tabellen fra en tekststreng."""
-    # Sørger for at vi takler escaped linjeskift (\n) som ofte kommer fra JSON-verdier
-    if '\\n' in text and '\n' not in text:
-        lines = text.split('\\n')
-    else:
-        lines = text.split('\n')
+def build_markdown_table(tasks_list):
+    """Tar en JSON-liste med oppgaver og bygger en pen ASCII-tabell for Slack."""
+    if not tasks_list or not isinstance(tasks_list, list):
+        return None
         
-    table_lines = []
-    in_table = False
+    table = "+----+------------------------------------------------------+-----------------+\n"
+    table += "| ID | Content                                              | Status          |\n"
+    table += "+----+------------------------------------------------------+-----------------+\n"
     
-    for line in lines:
-        stripped = line.strip()
-        # En typisk Markdown/ASCII tabell starter og slutter med +-- eller har | rammer
-        if stripped.startswith('+--') or stripped.startswith('|'):
-            in_table = True
-            table_lines.append(line.rstrip())
-        elif in_table and stripped:
-            # Vi traff tekst som ikke hører til tabellen, så vi avbryter loopen
-            break
+    for i, task in enumerate(tasks_list):
+        # Henter ut feltene uavhengig av nøyaktig hva Holmes kaller dem
+        task_id = str(task.get('id', task.get('ID', i+1)))
+        content = str(task.get('content', task.get('description', task.get('task', ''))))
+        status = str(task.get('status', task.get('state', 'pending'))).lower()
+        
+        # Formaterer statusen slik vi kjenner den fra loggene
+        if status in ['completed', 'done', 'true', 'success']:
+            status_fmt = "[✓] completed"
+        elif status in ['in_progress', 'progressing', 'running', 'active']:
+            status_fmt = "[~] in_progress"
+        else:
+            status_fmt = "[ ] pending"
             
-    # Returner kun hvis vi fant en faktisk tabell (minimum header + linje + data)
-    if len(table_lines) >= 3:
-        return "\n".join(table_lines)
-    return None
+        # Tilpasser bredden slik at tabellen aldri brekker i Slack
+        if len(content) > 52:
+            content = content[:49] + "..."
+            
+        table += f"| {task_id:<2} | {content:<52} | {status_fmt:<15} |\n"
+        
+    table += "+----+------------------------------------------------------+-----------------+"
+    return table
 
-def find_table_in_json(obj):
-    """Søker rekursivt igjennom et JSON-objekt for å finne ASCII-tabellen, uavhengig av formatering."""
-    if isinstance(obj, str):
-        # 1. Prøv å se om strengen inneholder en tabell direkte
-        table = extract_table(obj)
-        if table:
-            return table
-            
-        # 2. Holmes sender ofte tool-argumenter (som TodoWrite) som en indre JSON-streng. Prøv å pakke ut!
-        try:
-            inner_obj = json.loads(obj)
-            res = find_table_in_json(inner_obj)
-            if res: return res
-        except:
-            pass
-            
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            res = find_table_in_json(v)
+def extract_tasks_from_json(obj):
+    """Leter rekursivt etter selve listen med oppgaver i Holmes' JSON-struktur."""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            # Sjekker om verdien er en liste med oppgave-dictionaries
+            if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                if any(k in val[0] for k in ['status', 'state']) and any(k in val[0] for k in ['content', 'description', 'task']):
+                    return val
+        for val in obj.values():
+            res = extract_tasks_from_json(val)
             if res: return res
             
     elif isinstance(obj, list):
         for item in obj:
-            res = find_table_in_json(item)
+            res = extract_tasks_from_json(item)
             if res: return res
+            
+    elif isinstance(obj, str):
+        # LLM-er sender ofte JSON-argumenter som en innkapslet (escaped) tekststreng
+        try:
+            parsed = json.loads(obj)
+            return extract_tasks_from_json(parsed)
+        except:
+            pass
             
     return None
 
 def process_message_async(client, message, say):
-    """Kjører asynkront i bakgrunnen."""
     channel = message.get("channel")
     ts = message.get("ts")
     thread_ts = message.get("thread_ts", ts)
@@ -121,12 +125,11 @@ def process_message_async(client, message, say):
     if not user_query:
         return
 
-    # 1. Send initial statusmelding til Slack
     try:
         placeholder = say(text="🔍 _Holmes oppretter en feilsøkingsplan..._", thread_ts=thread_ts)
         placeholder_ts = placeholder.get("ts")
     except Exception as e:
-        logging.error(f"Feil ved sending av initial status til Slack: {e}")
+        logging.error(f"Feil ved sending av initial status: {e}")
         return
 
     if message.get("thread_ts"):
@@ -136,7 +139,7 @@ def process_message_async(client, message, say):
     else:
         prompt = user_query
 
-    current_tasks = ""
+    current_tasks_table = ""
     current_action = "Oppretter kobling til klyngen..."
     final_answer = "Fikk ingen endelig analyse fra Holmes."
 
@@ -165,12 +168,14 @@ def process_message_async(client, message, say):
                 try:
                     data = json.loads(data_str)
                     
-                    # --- DYNAMISK TABELL-SKANNING PÅ HVERT ENESTE EVENT ---
-                    found_table = find_table_in_json(data)
-                    if found_table:
-                        if current_tasks != found_table.strip():
-                            current_tasks = found_table.strip()
-                            logging.info(f"Tabell oppdatert! (Lengde: {len(current_tasks)})")
+                    # --- DYNAMISK TABELL-BYGGER ---
+                    # Henter ut den rå JSON-listen og tegner tabellen manuelt
+                    raw_tasks = extract_tasks_from_json(data)
+                    if raw_tasks:
+                        new_table = build_markdown_table(raw_tasks)
+                        if new_table and new_table != current_tasks_table:
+                            current_tasks_table = new_table
+                            logging.info("Tegnet ny oppdatert tabell fra JSON-data!")
 
                     # --- OPPDATERING AV HANDLING PÅGÅR ---
                     if current_event == "start_tool_calling":
@@ -190,13 +195,12 @@ def process_message_async(client, message, say):
                     elif current_event == "ai_answer_end":
                         final_answer = data.get("analysis", final_answer)
                     
-                    # PUSH OPPDATERINGEN TIL SLACK UMiddelbart
-                    update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
+                    # Pusher skjermbildet til Slack for hvert lille steg!
+                    update_slack_status(client, channel, placeholder_ts, current_tasks_table, current_action)
                         
                 except Exception as parse_err:
                     logging.error(f"Tolkningsfeil: {parse_err}")
 
-        # Erstatt med endelig svar når strømmen er ferdig
         client.chat_update(channel=channel, ts=placeholder_ts, text=final_answer)
 
     except Exception as e:
