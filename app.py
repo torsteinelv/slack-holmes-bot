@@ -6,7 +6,7 @@ import threading
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# --- Konfigurer strukturert logging for Kubernetes ---
+# --- Konfigurere strukturert logging for Kubernetes ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -124,6 +124,7 @@ def process_message_async(client, message, say):
                 try:
                     data = json.loads(data_str)
                     
+                    # EVENT: Holmes starter et nytt verktøy (f.eks. en kubectl-kommando)
                     if current_event == "start_tool_calling":
                         tool_name = data.get("tool_name", "")
                         description = data.get("description", "Undersøker...")
@@ -136,15 +137,34 @@ def process_message_async(client, message, say):
                         
                         update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
                     
+                    # EVENT: Et verktøy ble ferdig. Her fanger vi opp oppgaveliste-tabellen fra TodoWrite
                     elif current_event == "tool_calling_result":
                         tool_name = data.get("name") or data.get("tool_name")
-                        result_obj = data.get("result", {})
+                        result_obj = data.get("result")
                         logging.info(f"[Holmes Event] Verktøy fullført: {tool_name}")
                         
-                        if tool_name == "TodoWrite" and isinstance(result_obj, dict):
-                            tool_data = result_obj.get("data")
-                            if isinstance(tool_data, str) and "+--" in tool_data:
-                                current_tasks = tool_data.strip()
+                        if tool_name == "TodoWrite" and result_obj:
+                            found_tasks = None
+                            
+                            # Sjekk 1: Hvis resultatet er en ren rå tekststreng (slik loggen din indikerer)
+                            if isinstance(result_obj, str) and "+--" in result_obj:
+                                found_tasks = result_obj.strip()
+                            
+                            # Sjekk 2: Hvis det er pakket inn i en ordbok (som fallback)
+                            elif isinstance(result_obj, dict):
+                                for key in ["data", "output", "result", "content"]:
+                                    val = result_obj.get(key)
+                                    if isinstance(val, str) and "+--" in val:
+                                        found_tasks = val.strip()
+                                        break
+                                else:
+                                    if "+--" in str(result_obj):
+                                        found_tasks = str(result_obj).strip()
+                            
+                            # Hvis vi fant en gyldig ASCII-tabell, oppdater Slack!
+                            if found_tasks:
+                                current_tasks = found_tasks
+                                logging.info(f"Suksess: Fant og oppdaterte oppgaveliste ({len(current_tasks)} tegn)")
                                 update_slack_status(client, channel, placeholder_ts, current_tasks, current_action)
                     
                     elif current_event == "ai_message":
