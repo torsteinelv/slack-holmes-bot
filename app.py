@@ -154,7 +154,8 @@ def process_message_async(client, message, say):
             json={"ask": prompt, "model": MODEL, "stream": True},
             headers={"Accept": "text/event-stream"},
             stream=True,
-            timeout=(15, 3600)  # 15 sek for å koble til, 120 sek max stillhet mellom events
+            # 15 sek for å koble til, 3600 sek (1 time) max stillhet mellom events
+            timeout=(15, 3600)  
         )
         response.raise_for_status()
 
@@ -211,7 +212,7 @@ def process_message_async(client, message, say):
         logging.info("Suksess: Feilsøking fullført og endelig svar sendt til Slack.")
 
     except requests.exceptions.Timeout:
-        error_msg = "❌ Det oppstod et tidsavbrudd: Holmes har ikke sendt noen oppdateringer på 2 minutter. Sjekk `kubectl logs` for Holmes-serveren."
+        error_msg = "❌ Det oppstod et tidsavbrudd: Holmes har ikke sendt noen oppdateringer på 1 time. Kanskje prosessen har hengt seg opp?"
         logging.error("Tidsavbrudd (Timeout) under feilsøking.")
         client.chat_update(channel=channel, ts=placeholder_ts, text=error_msg)
     except Exception as e:
