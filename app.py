@@ -154,7 +154,7 @@ def process_message_async(client, message, say):
             json={"ask": prompt, "model": MODEL, "stream": True},
             headers={"Accept": "text/event-stream"},
             stream=True,
-            timeout=(15, 120)  # 15 sek for å koble til, 120 sek max stillhet mellom events
+            timeout=(15, None)  # 15 sek for å koble til, 120 sek max stillhet mellom events
         )
         response.raise_for_status()
 
