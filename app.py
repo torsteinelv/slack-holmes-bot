@@ -38,16 +38,18 @@ def get_thread_context(client, channel, thread_ts):
         return ""
 
 def update_slack_status(client, channel, ts, tasks_table, action):
-    """Bygger og oppdaterer fremdriftsstatusen i Slack-meldingen."""
+    """Bygger og oppdaterer fremdriftsstatusen i Slack-meldingen med lengde-beskyttelse."""
     status_text = "🔍 *Holmes feilsøker saken...*\n"
     
-    # Tegner tabellen øverst hvis den er funnet og generert
     if tasks_table:
         status_text += f"\n```\n{tasks_table}\n```\n"
         
-    # Tegner handlingen nederst
     if action:
         status_text += f"\n{action}"
+        
+    # SIKKERHET: Slack tillater maks 40 000 tegn. Kutter på 39 000 for sikkerhets skyld.
+    if len(status_text) > 39000:
+        status_text = status_text[:39000] + "\n\n... ⚠️ *[Status avkortet pga. Slacks tegnbegrensning]*"
         
     try:
         client.chat_update(channel=channel, ts=ts, text=status_text)
@@ -64,12 +66,10 @@ def build_markdown_table(tasks_list):
     table += "+----+------------------------------------------------------+-----------------+\n"
     
     for i, task in enumerate(tasks_list):
-        # Henter ut feltene uavhengig av nøyaktig hva Holmes kaller dem
         task_id = str(task.get('id', task.get('ID', i+1)))
         content = str(task.get('content', task.get('description', task.get('task', ''))))
         status = str(task.get('status', task.get('state', 'pending'))).lower()
         
-        # Formaterer statusen slik vi kjenner den fra loggene
         if status in ['completed', 'done', 'true', 'success']:
             status_fmt = "[✓] completed"
         elif status in ['in_progress', 'progressing', 'running', 'active']:
@@ -77,7 +77,6 @@ def build_markdown_table(tasks_list):
         else:
             status_fmt = "[ ] pending"
             
-        # Tilpasser bredden slik at tabellen aldri brekker i Slack
         if len(content) > 52:
             content = content[:49] + "..."
             
@@ -90,7 +89,6 @@ def extract_tasks_from_json(obj):
     """Leter rekursivt etter selve listen med oppgaver i Holmes' JSON-struktur."""
     if isinstance(obj, dict):
         for key, val in obj.items():
-            # Sjekker om verdien er en liste med oppgave-dictionaries
             if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
                 if any(k in val[0] for k in ['status', 'state']) and any(k in val[0] for k in ['content', 'description', 'task']):
                     return val
@@ -104,7 +102,6 @@ def extract_tasks_from_json(obj):
             if res: return res
             
     elif isinstance(obj, str):
-        # LLM-er sender ofte JSON-argumenter som en innkapslet (escaped) tekststreng
         try:
             parsed = json.loads(obj)
             return extract_tasks_from_json(parsed)
@@ -126,7 +123,6 @@ def process_message_async(client, message, say):
     if not user_query:
         return
 
-    # 1. Send initial statusmelding til Slack
     try:
         placeholder = say(text="🔍 _Holmes oppretter en feilsøkingsplan..._", thread_ts=thread_ts)
         placeholder_ts = placeholder.get("ts")
@@ -134,7 +130,6 @@ def process_message_async(client, message, say):
         logging.error(f"Feil ved sending av initial status: {e}")
         return
 
-    # 2. Hent trådkontekst hvis relevant
     if message.get("thread_ts"):
         history = get_thread_context(client, channel, thread_ts)
         prompt = (f"Du er en AI-assistent i en pågående Slack-samtale. Her er historikken:\n"
@@ -146,7 +141,6 @@ def process_message_async(client, message, say):
     current_action = "Oppretter kobling til klyngen..."
     final_answer = "Fikk ingen endelig analyse fra Holmes."
 
-    # 3. Stream fra Holmes-API-et med smart timeout
     try:
         logging.info(f"Starter live-analyse for query: '{user_query[:50]}...'")
         response = requests.post(
@@ -154,8 +148,7 @@ def process_message_async(client, message, say):
             json={"ask": prompt, "model": MODEL, "stream": True},
             headers={"Accept": "text/event-stream"},
             stream=True,
-            # 15 sek for å koble til, 3600 sek (1 time) max stillhet mellom events
-            timeout=(15, 3600)  
+            timeout=(15, 3600)  # 15 sek for å koble til, 1 time max stillhet mellom events
         )
         response.raise_for_status()
 
@@ -174,8 +167,6 @@ def process_message_async(client, message, say):
                 try:
                     data = json.loads(data_str)
                     
-                    # --- DYNAMISK TABELL-BYGGER ---
-                    # Henter ut den rå JSON-listen og tegner tabellen manuelt
                     raw_tasks = extract_tasks_from_json(data)
                     if raw_tasks:
                         new_table = build_markdown_table(raw_tasks)
@@ -183,7 +174,6 @@ def process_message_async(client, message, say):
                             current_tasks_table = new_table
                             logging.info("Tegnet ny oppdatert tabell fra JSON-data!")
 
-                    # --- OPPDATERING AV HANDLING PÅGÅR ---
                     if current_event == "start_tool_calling":
                         tool_name = data.get("tool_name", "")
                         description = data.get("description", "Undersøker...")
@@ -207,13 +197,16 @@ def process_message_async(client, message, say):
                 except Exception as parse_err:
                     logging.error(f"Tolkningsfeil: {parse_err}")
 
-        # Erstatt med endelig svar når strømmen er ferdig
+        # --- SIKKERHET: Pass på at endelig svar ikke overstiger Slacks grense ---
+        if len(final_answer) > 39000:
+            final_answer = final_answer[:39000] + "\n\n... ⚠️ *[Svaret fra Holmes var for langt for én Slack-melding og ble avkortet]*"
+
         client.chat_update(channel=channel, ts=placeholder_ts, text=final_answer)
         logging.info("Suksess: Feilsøking fullført og endelig svar sendt til Slack.")
 
     except requests.exceptions.Timeout:
         error_msg = "❌ Det oppstod et tidsavbrudd: Holmes har ikke sendt noen oppdateringer på 1 time. Kanskje prosessen har hengt seg opp?"
-        logging.error("Tidsavbrudd (Timeout) under feilsøking.")
+        logging.error("Tidsavbrudd (Timeout) under feilsøking. Ingen svar på 1 time.")
         client.chat_update(channel=channel, ts=placeholder_ts, text=error_msg)
     except Exception as e:
         error_msg = f"❌ Det oppstod en feil under undersøkelsen: {str(e)}"
